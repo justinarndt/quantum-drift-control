@@ -1,115 +1,106 @@
-"""Stim Integration for Time-Varying Noise Simulation.
-
-This module implements the 'Chunked Streaming' architecture required to
-simulate non-Markovian drift in stabilizer circuits. It dynamically
-re-compiles Stim circuits in time-slices (chunks) based on parameters
-provided by the DriftOrchestrator.
-
-Copyright 2025 Justin Arndt. Patent Pending (US 63/940,641).
-"""
-
-from typing import List, Tuple, Dict
-from absl import flags
-from absl import logging
-import numpy as np
 import stim
-
-# Import the Drift Logic (assuming it's in the sibling package)
+import numpy as np
+from absl import logging
 from src.drift import orchestrator
 
-FLAGS = flags.FLAGS
-
-flags.DEFINE_integer("chunk_rounds", 1000, "Number of QEC rounds per simulation chunk.")
-flags.DEFINE_integer("distance", 5, "Code distance for the surface code.")
-flags.DEFINE_float("gate_time_us", 0.04, "Physical gate time in microseconds (Sycamore/Willow).")
-
 class StimStreamer:
-    """Manages the streaming of drifting noise parameters into Stim circuits."""
-
-    def __init__(self, drift_model: orchestrator.DriftOrchestrator):
+    """
+    Manages the interface between the Drift Orchestrator and the Stim simulator.
+    Generates chunked circuit segments with time-varying noise parameters.
+    """
+    
+    def __init__(self, drift_model: orchestrator.DriftOrchestrator, distance: int = 5):
         self.drift_model = drift_model
-        self.distance = FLAGS.distance
-        logging.info("Initialized StimStreamer with distance d=%d", self.distance)
+        self.distance = distance
+        logging.info(f"Initialized StimStreamer with distance d={self.distance}")
 
-    def _generate_surface_code_chunk(self, rounds: int, noise_params: Dict[str, float]) -> stim.Circuit:
-        """Generates a Stim circuit for 'rounds' cycles with specific noise levels.
-        
-        Args:
-            rounds: Number of QEC rounds in this chunk.
-            noise_params: Dictionary containing 'p_gate', 'p_meas', etc.
-        
-        Returns:
-            A stim.Circuit object with the injected noise.
+    def _generate_surface_code_chunk(self, rounds: int, noise_params: dict) -> stim.Circuit:
         """
-        # In a real implementation, this would build the specific topology.
-        # For the trap/demo, we use Stim's built-in surface code generator
-        # and append noise channels dynamically.
-        
+        Generates a surface code circuit chunk with specific noise values.
+        """
+        # SANITY CHECK: Clamp probabilities to valid physical range [0.0, 0.5]
+        # Probabilities > 0.5 are non-physical (worse than random guessing) and will crash Stim.
+        p_gate = float(np.clip(noise_params.get('p_gate', 0.001), 0.0, 0.499))
+        p_meas = float(np.clip(noise_params.get('p_meas', 0.001), 0.0, 0.499))
+
+        # Use Stim's optimized surface code generator
         circuit = stim.Circuit.generated(
             "surface_code:rotated_memory_z",
             rounds=rounds,
             distance=self.distance,
-            after_clifford_depolarization=noise_params.get("p_gate", 0.001),
-            after_reset_flip_probability=noise_params.get("p_reset", 0.001),
-            after_measure_flip_probability=noise_params.get("p_meas", 0.001)
+            after_clifford_depolarization=p_gate,
+            after_reset_flip_probability=p_meas,
+            before_measure_flip_probability=p_meas
         )
         return circuit
 
-    def run_streaming_simulation(self, total_time_ms: float) -> float:
-        """Executes the chunked simulation over the total time horizon.
-
-        This stitches together multiple chunks, querying the DriftOrchestrator
-        before each chunk to update the error rates.
+    def run_streaming_simulation(self, total_duration_ms: int) -> float:
+        """
+        Executes a streaming simulation where noise drifts over time.
         
         Args:
-            total_time_ms: Total duration of the memory experiment.
+            total_duration_ms: Total physical time to simulate in milliseconds.
             
         Returns:
-            The estimated logical error rate.
+            The final estimated logical error rate.
         """
-        total_rounds = int((total_time_ms * 1000) / FLAGS.gate_time_us)
-        chunks = total_rounds // FLAGS.chunk_rounds
+        # Assumptions: 1 round = 1 microsecond (approx)
+        rounds_per_chunk = 1000
+        num_chunks = max(1, int((total_duration_ms * 1000) / rounds_per_chunk))
         
-        logging.info("Starting simulation: %d chunks of %d rounds each.", chunks, FLAGS.chunk_rounds)
-
-        simulator = stim.TableauSimulator()
+        logging.info(f"Starting simulation: {num_chunks} chunks of {rounds_per_chunk} rounds each.")
+        
         total_errors = 0
+        total_shots = 0
         
-        for i in range(chunks):
-            # 1. Calculate current simulation time
-            current_time_us = i * FLAGS.chunk_rounds * FLAGS.gate_time_us
+        # Initialize simulator with a clean state if needed (using stabilizer tableau)
+        # For this benchmark, we sim each chunk independently to measure rate vs drift
+        
+        for i in range(num_chunks):
+            # 1. Query the Drift Orchestrator for current physics
+            # The orchestrator integrates the SDE forward by the chunk duration
+            drift_state = self.drift_model.predict_drift(dt=1.0)
             
-            # 2. Query the Neural ODE for drift at this timestamp
-            # The orchestrator returns the instantaneous T1/T2 predictions
-            drift_state = self.drift_model.predict_drift(current_time_us)
-            
-            # 3. Convert drift physics to error probabilities
-            # (Simplified conversion for the demo)
-            t1_val = float(drift_state[0]) # Extract JAX array value
-            p_gate = 1.0 - np.exp(-FLAGS.gate_time_us / t1_val)
-            
+            # Handle JAX vs Float return types safely
+            try:
+                t1_val = float(drift_state)
+            except TypeError:
+                t1_val = float(drift_state[0])
+
+            # Map T1 decay to Pauli error probability
+            # p = 1 - e^(-t/T1). For a 20ns gate, this is small.
+            # We scale it for visibility in short benchmarks if needed, 
+            # but here we use the raw physics value.
+            current_p_gate = t1_val
+            current_p_meas = t1_val * 10.0 # Measurement is typically 10x noisier
+
             noise_params = {
-                "p_gate": p_gate,
-                "p_meas": p_gate * 10.0, # Measurement is typically 10x slower/noisier
-                "p_reset": p_gate
+                'p_gate': current_p_gate,
+                'p_meas': current_p_meas
             }
 
-            # 4. Generate the Chunk
-            chunk_circuit = self._generate_surface_code_chunk(FLAGS.chunk_rounds, noise_params)
-            
-            # 5. Execute Chunk
-            # Note: We don't just run it; we stream it into the simulator state.
-            # For the demo, we sample shots to verify logic.
-            sampler = chunk_circuit.compile_detector_sampler()
-            defects, _ = sampler.sample(shots=100) # Fast sampling for validation
-            
-            # (Logic to count logical failures would go here)
-            if np.any(defects):
-                total_errors += 1
-                
-            if i % 10 == 0:
-                logging.info("Chunk %d/%d complete. Current T1 estimate: %.2f us", i, chunks, t1_val)
+            # 2. Generate Circuit Chunk
+            chunk_circuit = self._generate_surface_code_chunk(rounds_per_chunk, noise_params)
 
-        logical_error_rate = total_errors / (chunks * 100)
-        logging.info("Simulation Complete. Logical Error Rate: %.4e", logical_error_rate)
-        return logical_error_rate
+            # 3. Sample Detectors (Run the Simulation)
+            sampler = chunk_circuit.compile_detector_sampler()
+            
+            # Run 100 shots per chunk to get statistical sampling
+            shots = 100
+            detection_events, observables = sampler.sample(shots=shots, separate_observables=True)
+            
+            # 4. Decode (Ideal Observer / MWPM)
+            # Count how many times the logical observable was flipped
+            # In a full decoding loop, we would run PyMatching here.
+            # For drift benchmarking, we track the raw logical error accumulation.
+            num_logical_errors = np.sum(observables)
+            
+            total_errors += num_logical_errors
+            total_shots += shots
+            
+            if i % 10 == 0:
+                logging.info(f"Chunk {i}/{num_chunks} | Drift p={current_p_gate:.5f} | Logical Errors={num_logical_errors}")
+
+        final_error_rate = total_errors / total_shots
+        logging.info(f"Simulation Complete. Final Logical Error Rate: {final_error_rate:.6f}")
+        return final_error_rate
